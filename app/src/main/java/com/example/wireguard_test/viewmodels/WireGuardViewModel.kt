@@ -1,6 +1,9 @@
 package com.example.wireguard_test.viewmodels
 
 import android.app.Application
+import android.content.Intent
+import android.net.VpnService
+import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -37,7 +40,8 @@ data class WireGuardUiState(
     val peerPublicKey: String = "4WB1RuKGq5MRgC47vojZJStwfpOPhzYpBMfwveMtyUI=",
     val endpoint: String = "142.93.170.233:51820",
     val allowedIps: String = "0.0.0.0/0",
-    val errorMessage: String = ""
+    val errorMessage: String = "",
+    val needsVpnPermission: Boolean = false
 )
 
 class WireGuardViewModel(application: Application) : AndroidViewModel(application) {
@@ -79,7 +83,36 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.value = _uiState.value.copy(allowedIps = value)
     }
 
-    fun connect() {
+    fun getVpnPermissionIntent(): Intent? {
+        return VpnService.prepare(getApplication())
+    }
+
+    fun checkAndConnect() {
+        Log.d("WireGuard", "checkAndConnect() called")
+        val vpnIntent = getVpnPermissionIntent()
+        if (vpnIntent != null) {
+            Log.d("WireGuard", "VPN permission needed, setting needsVpnPermission = true")
+            _uiState.value = _uiState.value.copy(needsVpnPermission = true)
+        } else {
+            Log.d("WireGuard", "VPN permission already granted, calling connect()")
+            connect()
+        }
+    }
+
+    fun onVpnPermissionResult(granted: Boolean) {
+        Log.d("WireGuard", "onVpnPermissionResult: granted = $granted")
+        _uiState.value = _uiState.value.copy(needsVpnPermission = false)
+        if (granted) {
+            connect()
+        } else {
+            _uiState.value = _uiState.value.copy(
+                errorMessage = "VPN permission denied. Cannot establish connection."
+            )
+        }
+    }
+
+    private fun connect() {
+        Log.d("WireGuard", "connect() called - this should only happen after permission is granted")
         viewModelScope.launch {
             try {
                 _uiState.value = _uiState.value.copy(errorMessage = "")
@@ -145,7 +178,9 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
 
-        interfaceBuilder.parseListenPort("51820")
+        // Don't set listen port for client configs - remove this line
+        // interfaceBuilder.parseListenPort("51820")
+
         builder.setInterface(interfaceBuilder.build())
 
         // Peer configuration

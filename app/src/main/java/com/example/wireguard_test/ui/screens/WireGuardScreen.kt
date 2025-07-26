@@ -1,6 +1,5 @@
 package com.example.wireguard_test.ui.screens
 
-
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -14,8 +13,18 @@ import com.example.wireguard_test.viewmodels.WireGuardViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun WireGuardScreen(viewModel: WireGuardViewModel) {
+fun WireGuardScreen(
+    viewModel: WireGuardViewModel,
+    onRequestVpnPermission: () -> Unit
+) {
     val uiState by viewModel.uiState.collectAsState()
+
+    // Handle VPN permission request
+    LaunchedEffect(uiState.needsVpnPermission) {
+        if (uiState.needsVpnPermission) {
+            onRequestVpnPermission()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -61,7 +70,7 @@ fun WireGuardScreen(viewModel: WireGuardViewModel) {
                 Switch(
                     checked = uiState.isConnected,
                     onCheckedChange = {
-                        if (it) viewModel.connect() else viewModel.disconnect()
+                        if (it) viewModel.checkAndConnect() else viewModel.disconnect()
                     }
                 )
             }
@@ -196,7 +205,7 @@ fun WireGuardScreen(viewModel: WireGuardViewModel) {
         // Connect/Disconnect Button
         Button(
             onClick = {
-                if (uiState.isConnected) viewModel.disconnect() else viewModel.connect()
+                if (uiState.isConnected) viewModel.disconnect() else viewModel.checkAndConnect()
             },
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(
