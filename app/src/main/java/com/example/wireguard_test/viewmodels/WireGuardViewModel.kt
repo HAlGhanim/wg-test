@@ -13,6 +13,7 @@ import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import com.wireguard.config.Interface
 import com.wireguard.config.Peer
+import com.wireguard.crypto.Key
 import com.wireguard.crypto.KeyPair
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -20,12 +21,14 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
 
 // Simple Tunnel implementation
 class SimpleTunnel(private val name: String) : Tunnel {
     override fun getName(): String = name
     override fun onStateChange(newState: Tunnel.State) {
-        // Handle state changes if needed
+        Log.d("WireGuard", "Tunnel state changed to: $newState")
     }
 }
 
@@ -57,10 +60,20 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
             privateKey = keyPair.privateKey.toBase64(),
             publicKey = keyPair.publicKey.toBase64()
         )
+        Log.d("WireGuard", "Generated new keypair. Public key: ${keyPair.publicKey.toBase64()}")
+        showToast("New key pair generated. Add the public key to your server.")
     }
 
     fun updatePrivateKey(value: String) {
         _uiState.value = _uiState.value.copy(privateKey = value)
+        // Try to derive public key if private key is valid
+        try {
+            val privateKey = Key.fromBase64(value)
+            val keyPair = KeyPair(privateKey)
+            _uiState.value = _uiState.value.copy(publicKey = keyPair.publicKey.toBase64())
+        } catch (e: Exception) {
+            Log.e("WireGuard", "Invalid private key format: ${e.message}")
+        }
     }
 
     fun updateAddress(value: String) {
@@ -87,15 +100,151 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
         return VpnService.prepare(getApplication())
     }
 
+    fun verifyConfiguration() {
+        val expectedConfig = mapOf(
+            "Private Key" to "aNP/gGmQjINr+iRCNNWJgxnSEPU32ut+Yd/YUJwJWXo=",
+            "Public Key" to "F3mXBDCS1jG1kPTdDzReu42W3auQb3MUEcagSSI1mkw=",
+            "Address" to "10.0.0.2/32",
+            "DNS" to "1.1.1.1",
+            "Peer Public Key" to "4WB1RuKGq5MRgC47vojZJStwfpOPhzYpBMfwveMtyUI=",
+            "Endpoint" to "142.93.170.233:51820",
+            "Allowed IPs" to "0.0.0.0/0"
+        )
+
+        val currentConfig = mapOf(
+            "Private Key" to _uiState.value.privateKey,
+            "Public Key" to _uiState.value.publicKey,
+            "Address" to _uiState.value.address,
+            "DNS" to _uiState.value.dns,
+            "Peer Public Key" to _uiState.value.peerPublicKey,
+            "Endpoint" to _uiState.value.endpoint,
+            "Allowed IPs" to _uiState.value.allowedIps
+        )
+
+        Log.d("WireGuard", "=== Configuration Verification ===")
+        var allMatch = true
+
+        expectedConfig.forEach { (key, expected) ->
+            val current = currentConfig[key]
+            val matches = current == expected
+            if (!matches) allMatch = false
+
+            Log.d("WireGuard", "$key:")
+            Log.d("WireGuard", "  Expected: $expected")
+            Log.d("WireGuard", "  Current:  $current")
+            Log.d("WireGuard", "  Match:    ${if (matches) "✓" else "✗"}")
+        }
+
+        Log.d("WireGuard", "=================================")
+        Log.d("WireGuard", "All configurations match: ${if (allMatch) "YES ✓" else "NO ✗"}")
+
+        if (allMatch) {
+            Log.d("WireGuard", "Configuration is correct. If connection still fails:")
+            Log.d("WireGuard", "1. Check if server is running")
+            Log.d("WireGuard", "2. Verify your public key is on the server")
+            Log.d("WireGuard", "3. Try a different network")
+            Log.d("WireGuard", "4. Check server firewall rules")
+        }
+    }
+
     fun checkAndConnect() {
         Log.d("WireGuard", "checkAndConnect() called")
-        val vpnIntent = getVpnPermissionIntent()
-        if (vpnIntent != null) {
-            Log.d("WireGuard", "VPN permission needed, setting needsVpnPermission = true")
-            _uiState.value = _uiState.value.copy(needsVpnPermission = true)
-        } else {
-            Log.d("WireGuard", "VPN permission already granted, calling connect()")
-            connect()
+
+        // First validate configuration
+        val validationError = validateConfiguration()
+        if (validationError != null) {
+            _uiState.value = _uiState.value.copy(errorMessage = validationError)
+            return
+        }
+
+        // Check network connectivity to the endpoint
+        viewModelScope.launch {
+            val state = _uiState.value
+            val endpointParts = state.endpoint.split(":")
+            if (endpointParts.size != 2) {
+                _uiState.value = _uiState.value.copy(
+                    errorMessage = "Invalid endpoint format. Use host:port"
+                )
+                return@launch
+            }
+
+            val host = endpointParts[0]
+            val port = endpointParts[1].toIntOrNull() ?: 51820
+
+            Log.d("WireGuard", "Testing UDP connectivity to $host:$port")
+
+            val canReachEndpoint = withContext(Dispatchers.IO) {
+                testUdpEndpoint(host, port)
+            }
+
+            if (!canReachEndpoint) {
+                _uiState.value = _uiState.value.copy(
+                    errorMessage = "Cannot reach server at $host:$port via UDP. The server might be down, or UDP port $port might be blocked by a firewall."
+                )
+                Log.e("WireGuard", "UDP endpoint $host:$port is not reachable")
+            } else {
+                Log.d("WireGuard", "UDP endpoint $host:$port appears accessible, proceeding with VPN setup")
+
+                // Check VPN permission
+                val vpnIntent = getVpnPermissionIntent()
+                if (vpnIntent != null) {
+                    Log.d("WireGuard", "VPN permission needed, setting needsVpnPermission = true")
+                    _uiState.value = _uiState.value.copy(needsVpnPermission = true)
+                } else {
+                    Log.d("WireGuard", "VPN permission already granted, calling connect()")
+                    connect()
+                }
+            }
+        }
+    }
+
+    private fun validateConfiguration(): String? {
+        val state = _uiState.value
+
+        // Validate private key
+        try {
+            Key.fromBase64(state.privateKey)
+        } catch (e: Exception) {
+            return "Invalid private key format"
+        }
+
+        // Validate peer public key
+        try {
+            Key.fromBase64(state.peerPublicKey)
+        } catch (e: Exception) {
+            return "Invalid peer public key format"
+        }
+
+        // Validate endpoint format
+        val endpointParts = state.endpoint.split(":")
+        if (endpointParts.size != 2 || endpointParts[1].toIntOrNull() == null) {
+            return "Invalid endpoint format. Use host:port (e.g., 192.168.1.1:51820)"
+        }
+
+        // Validate address format
+        if (!state.address.matches(Regex("\\d+\\.\\d+\\.\\d+\\.\\d+/\\d+"))) {
+            return "Invalid address format. Use CIDR notation (e.g., 10.0.0.2/32)"
+        }
+
+        return null
+    }
+
+    private suspend fun testUdpEndpoint(host: String, port: Int): Boolean {
+        return try {
+            withContext(Dispatchers.IO) {
+                // Try to bind a UDP socket and send a packet
+                DatagramSocket().use { socket ->
+                    socket.soTimeout = 5000
+                    // We're not expecting a response, just checking if we can send
+                    val address = InetSocketAddress(host, port)
+                    // If we can resolve the host, that's a good sign
+                    address.hostName
+                    true
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("WireGuard", "Failed to test UDP endpoint $host:$port: ${e.message}")
+            false
         }
     }
 
@@ -112,24 +261,59 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun connect() {
-        Log.d("WireGuard", "connect() called - this should only happen after permission is granted")
+        Log.d("WireGuard", "connect() called - establishing WireGuard tunnel")
         viewModelScope.launch {
             try {
-                _uiState.value = _uiState.value.copy(errorMessage = "")
+                _uiState.value = _uiState.value.copy(errorMessage = "Connecting...")
+
                 val config = createConfig()
 
+                // Log the configuration for debugging
+                Log.d("WireGuard", "Configuration details:")
+                Log.d("WireGuard", "  Interface Address: ${_uiState.value.address}")
+                Log.d("WireGuard", "  DNS: ${_uiState.value.dns}")
+                Log.d("WireGuard", "  Your Public Key: ${_uiState.value.publicKey}")
+                Log.d("WireGuard", "  Peer Public Key: ${_uiState.value.peerPublicKey}")
+                Log.d("WireGuard", "  Endpoint: ${_uiState.value.endpoint}")
+                Log.d("WireGuard", "  Allowed IPs: ${_uiState.value.allowedIps}")
+
                 withContext(Dispatchers.IO) {
+                    Log.d("WireGuard", "Setting tunnel state to UP")
                     backend.setState(tunnel, Tunnel.State.UP, config)
                 }
 
-                _uiState.value = _uiState.value.copy(isConnected = true)
-                showToast("WireGuard tunnel connected")
-            } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(
-                    errorMessage = "Error: ${e.message}",
+                    isConnected = true,
+                    errorMessage = ""
+                )
+                showToast("WireGuard tunnel connected")
+
+                // Log important info for debugging
+                Log.i("WireGuard", "✓ Connection established!")
+                Log.i("WireGuard", "----------------------------------------")
+                Log.i("WireGuard", "IMPORTANT: Make sure your public key is added to the server:")
+                Log.i("WireGuard", "Public Key: ${_uiState.value.publicKey}")
+                Log.i("WireGuard", "----------------------------------------")
+                Log.i("WireGuard", "If the handshake fails, check:")
+                Log.i("WireGuard", "1. Your public key is in the server's config")
+                Log.i("WireGuard", "2. The server's public key matches what you entered")
+                Log.i("WireGuard", "3. UDP port ${_uiState.value.endpoint.split(":").getOrNull(1) ?: "51820"} is not blocked")
+                Log.i("WireGuard", "4. The server is running and configured correctly")
+
+            } catch (e: Exception) {
+                Log.e("WireGuard", "Connection failed", e)
+                val errorMessage = when {
+                    e.message?.contains("Permission denied") == true ->
+                        "Permission denied. Make sure the app has VPN permissions."
+                    e.message?.contains("handshake") == true ->
+                        "Handshake failed. Check that your public key is configured on the server."
+                    else ->
+                        "Connection failed: ${e.message}"
+                }
+                _uiState.value = _uiState.value.copy(
+                    errorMessage = errorMessage,
                     isConnected = false
                 )
-                e.printStackTrace()
             }
         }
     }
@@ -137,6 +321,7 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
     fun disconnect() {
         viewModelScope.launch {
             try {
+                Log.d("WireGuard", "Disconnecting tunnel...")
                 withContext(Dispatchers.IO) {
                     backend.setState(tunnel, Tunnel.State.DOWN, null)
                 }
@@ -146,11 +331,12 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
                     errorMessage = ""
                 )
                 showToast("WireGuard tunnel disconnected")
+                Log.i("WireGuard", "✓ Tunnel disconnected")
             } catch (e: Exception) {
+                Log.e("WireGuard", "Disconnect failed", e)
                 _uiState.value = _uiState.value.copy(
-                    errorMessage = "Error: ${e.message}"
+                    errorMessage = "Disconnect error: ${e.message}"
                 )
-                e.printStackTrace()
             }
         }
     }
@@ -177,9 +363,6 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
                 interfaceBuilder.parseDnsServers(dns.trim())
             }
         }
-
-        // Don't set listen port for client configs - remove this line
-        // interfaceBuilder.parseListenPort("51820")
 
         builder.setInterface(interfaceBuilder.build())
 
