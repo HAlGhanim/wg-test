@@ -1,7 +1,9 @@
 package com.example.wireguard_test.viewmodels
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.VpnService
 import android.util.Log
 import android.widget.Toast
@@ -9,6 +11,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.wireguard.android.backend.Backend
 import com.wireguard.android.backend.GoBackend
+import com.wireguard.android.backend.Statistics
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import com.wireguard.config.Interface
@@ -16,6 +19,7 @@ import com.wireguard.config.Peer
 import com.wireguard.crypto.Key
 import com.wireguard.crypto.KeyPair
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,40 +36,144 @@ class SimpleTunnel(private val name: String) : Tunnel {
     }
 }
 
-// IMPORTANT: These are test values. In production, never hardcode private keys!
-// The client private key should be generated and stored securely.
 data class WireGuardUiState(
     val isConnected: Boolean = false,
-    val privateKey: String = "aNP/gGmQjINr+iRCNNWJgxnSEPU32ut+Yd/YUJwJWXo=",
-    val publicKey: String = "F3mXBDCS1jG1kPTdDzReu42W3auQb3MUEcagSSI1mkw=",
-    val address: String = "10.0.0.2/32",
-    val dns: String = "1.1.1.1",
-    val peerPublicKey: String = "4WB1RuKGq5MRgC47vojZJStwfpOPhzYpBMfwveMtyUI=",
-    val endpoint: String = "142.93.170.233:51820",
-    val allowedIps: String = "0.0.0.0/0",
+    val privateKey: String = "",
+    val publicKey: String = "",
+    val address: String = "",
+    val dns: String = "",
+    val peerPublicKey: String = "",
+    val endpoint: String = "",
+    val allowedIps: String = "",
     val errorMessage: String = "",
-    val needsVpnPermission: Boolean = false
+    val needsVpnPermission: Boolean = false,
+    val serverLocation: String = "",
+    val localAddress: String = "",
+    val downloadSpeed: Long = 0L,
+    val uploadSpeed: Long = 0L,
+    val totalBytesReceived: Long = 0L,
+    val totalBytesSent: Long = 0L,
+    val isUsingDefaults: Boolean = false
 )
+
+object DefaultConfig {
+    const val privateKey = "aNP/gGmQjINr+iRCNNWJgxnSEPU32ut+Yd/YUJwJWXo="
+    const val publicKey = "F3mXBDCS1jG1kPTdDzReu42W3auQb3MUEcagSSI1mkw="
+    const val address = "10.0.0.2/32"
+    const val dns = "1.1.1.1"
+    const val peerPublicKey = "4WB1RuKGq5MRgC47vojZJStwfpOPhzYpBMfwveMtyUI="
+    const val endpoint = "142.93.170.233:51820"
+    const val allowedIps = "0.0.0.0/0"
+}
 
 class WireGuardViewModel(application: Application) : AndroidViewModel(application) {
     private val backend: Backend = GoBackend(application)
     private val tunnel: Tunnel = SimpleTunnel("wg0")
+    private val prefs: SharedPreferences = application.getSharedPreferences("wireguard_prefs", Context.MODE_PRIVATE)
 
     private val _uiState = MutableStateFlow(WireGuardUiState())
     val uiState: StateFlow<WireGuardUiState> = _uiState.asStateFlow()
+
+    private var lastBytesReceived = 0L
+    private var lastBytesSent = 0L
+    private var lastStatTime = System.currentTimeMillis()
+
+    init {
+        loadConfiguration()
+        // Start monitoring statistics when connected
+        viewModelScope.launch {
+            while (true) {
+                if (_uiState.value.isConnected) {
+                    updateStatistics()
+                }
+                delay(1000) // Update every second
+            }
+        }
+
+        // Log configuration info
+        Log.i("WireGuard", "=== WireGuard Configuration Loaded ===")
+        Log.i("WireGuard", "Public Key: ${_uiState.value.publicKey}")
+        Log.i("WireGuard", "Endpoint: ${_uiState.value.endpoint}")
+        Log.i("WireGuard", "Address: ${_uiState.value.address}")
+        Log.i("WireGuard", "=====================================")
+    }
+
+    private fun loadConfiguration() {
+        // Load configuration with default values as fallback
+        val privateKey = prefs.getString("private_key", DefaultConfig.privateKey) ?: DefaultConfig.privateKey
+        val peerPublicKey = prefs.getString("peer_public_key", DefaultConfig.peerPublicKey) ?: DefaultConfig.peerPublicKey
+        val endpoint = prefs.getString("endpoint", DefaultConfig.endpoint) ?: DefaultConfig.endpoint
+
+        // Check if we're using default values
+        val isUsingDefaults = privateKey == DefaultConfig.privateKey &&
+                peerPublicKey == DefaultConfig.peerPublicKey &&
+                endpoint == DefaultConfig.endpoint
+
+        _uiState.value = _uiState.value.copy(
+            privateKey = privateKey,
+            publicKey = prefs.getString("public_key", DefaultConfig.publicKey) ?: DefaultConfig.publicKey,
+            address = prefs.getString("address", DefaultConfig.address) ?: DefaultConfig.address,
+            dns = prefs.getString("dns", DefaultConfig.dns) ?: DefaultConfig.dns,
+            peerPublicKey = peerPublicKey,
+            endpoint = endpoint,
+            allowedIps = prefs.getString("allowed_ips", DefaultConfig.allowedIps) ?: DefaultConfig.allowedIps,
+            localAddress = prefs.getString("address", DefaultConfig.address) ?: DefaultConfig.address,
+            isUsingDefaults = isUsingDefaults
+        )
+
+        // Update server location based on endpoint
+        updateServerLocation(_uiState.value.endpoint)
+    }
+
+    private fun saveConfiguration() {
+        prefs.edit().apply {
+            putString("private_key", _uiState.value.privateKey)
+            putString("public_key", _uiState.value.publicKey)
+            putString("address", _uiState.value.address)
+            putString("dns", _uiState.value.dns)
+            putString("peer_public_key", _uiState.value.peerPublicKey)
+            putString("endpoint", _uiState.value.endpoint)
+            putString("allowed_ips", _uiState.value.allowedIps)
+            putString("server_location", _uiState.value.serverLocation)
+            apply()
+        }
+    }
 
     fun generateKeyPair() {
         val keyPair = KeyPair()
         _uiState.value = _uiState.value.copy(
             privateKey = keyPair.privateKey.toBase64(),
-            publicKey = keyPair.publicKey.toBase64()
+            publicKey = keyPair.publicKey.toBase64(),
+            isUsingDefaults = false
         )
+        saveConfiguration()
         Log.d("WireGuard", "Generated new keypair. Public key: ${keyPair.publicKey.toBase64()}")
         showToast("New key pair generated. Add the public key to your server.")
     }
 
+    fun resetToDefaults() {
+        _uiState.value = _uiState.value.copy(
+            privateKey = DefaultConfig.privateKey,
+            publicKey = DefaultConfig.publicKey,
+            address = DefaultConfig.address,
+            localAddress = DefaultConfig.address,
+            dns = DefaultConfig.dns,
+            peerPublicKey = DefaultConfig.peerPublicKey,
+            endpoint = DefaultConfig.endpoint,
+            allowedIps = DefaultConfig.allowedIps,
+            isUsingDefaults = true
+        )
+        updateServerLocation(DefaultConfig.endpoint)
+        saveConfiguration()
+        showToast("Configuration reset to defaults")
+        Log.d("WireGuard", "Configuration reset to default test values")
+    }
+
     fun updatePrivateKey(value: String) {
-        _uiState.value = _uiState.value.copy(privateKey = value)
+        _uiState.value = _uiState.value.copy(
+            privateKey = value,
+            isUsingDefaults = false
+        )
         // Try to derive public key if private key is valid
         try {
             val privateKey = Key.fromBase64(value)
@@ -74,77 +182,99 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
         } catch (e: Exception) {
             Log.e("WireGuard", "Invalid private key format: ${e.message}")
         }
+        saveConfiguration()
     }
 
     fun updateAddress(value: String) {
-        _uiState.value = _uiState.value.copy(address = value)
+        _uiState.value = _uiState.value.copy(
+            address = value,
+            localAddress = value,
+            isUsingDefaults = false
+        )
+        saveConfiguration()
     }
 
     fun updateDns(value: String) {
-        _uiState.value = _uiState.value.copy(dns = value)
+        _uiState.value = _uiState.value.copy(
+            dns = value,
+            isUsingDefaults = false
+        )
+        saveConfiguration()
     }
 
     fun updatePeerPublicKey(value: String) {
-        _uiState.value = _uiState.value.copy(peerPublicKey = value)
+        _uiState.value = _uiState.value.copy(
+            peerPublicKey = value,
+            isUsingDefaults = false
+        )
+        saveConfiguration()
     }
 
     fun updateEndpoint(value: String) {
-        _uiState.value = _uiState.value.copy(endpoint = value)
+        _uiState.value = _uiState.value.copy(
+            endpoint = value,
+            isUsingDefaults = false
+        )
+        // Try to determine server location from endpoint
+        updateServerLocation(value)
+        saveConfiguration()
     }
 
     fun updateAllowedIps(value: String) {
-        _uiState.value = _uiState.value.copy(allowedIps = value)
+        _uiState.value = _uiState.value.copy(
+            allowedIps = value,
+            isUsingDefaults = false
+        )
+        saveConfiguration()
+    }
+
+    private fun updateServerLocation(endpoint: String) {
+        // This is a simple implementation - you could enhance this with a real geo-IP service
+        val location = when {
+            endpoint.contains("ca.") || endpoint.contains("canada") -> "Canada"
+            endpoint.contains("us.") || endpoint.contains("usa") -> "United States"
+            endpoint.contains("uk.") || endpoint.contains("london") -> "United Kingdom"
+            endpoint.contains("de.") || endpoint.contains("germany") -> "Germany"
+            endpoint.contains("jp.") || endpoint.contains("japan") -> "Japan"
+            else -> "VPN Server"
+        }
+        _uiState.value = _uiState.value.copy(serverLocation = location)
+    }
+
+    private suspend fun updateStatistics() {
+        try {
+            withContext(Dispatchers.IO) {
+                val stats = backend.getStatistics(tunnel)
+                val currentTime = System.currentTimeMillis()
+                val timeDiff = (currentTime - lastStatTime) / 1000.0 // Convert to seconds
+
+                // Calculate speeds (bytes per second)
+                val downloadSpeed = if (timeDiff > 0 && lastBytesReceived > 0) {
+                    ((stats.totalRx() - lastBytesReceived) / timeDiff).toLong()
+                } else 0L
+
+                val uploadSpeed = if (timeDiff > 0 && lastBytesSent > 0) {
+                    ((stats.totalTx() - lastBytesSent) / timeDiff).toLong()
+                } else 0L
+
+                _uiState.value = _uiState.value.copy(
+                    downloadSpeed = downloadSpeed.coerceAtLeast(0),
+                    uploadSpeed = uploadSpeed.coerceAtLeast(0),
+                    totalBytesReceived = stats.totalRx(),
+                    totalBytesSent = stats.totalTx()
+                )
+
+                lastBytesReceived = stats.totalRx()
+                lastBytesSent = stats.totalTx()
+                lastStatTime = currentTime
+            }
+        } catch (e: Exception) {
+            Log.e("WireGuard", "Failed to update statistics: ${e.message}")
+        }
     }
 
     fun getVpnPermissionIntent(): Intent? {
         return VpnService.prepare(getApplication())
-    }
-
-    fun verifyConfiguration() {
-        val expectedConfig = mapOf(
-            "Private Key" to "aNP/gGmQjINr+iRCNNWJgxnSEPU32ut+Yd/YUJwJWXo=",
-            "Public Key" to "F3mXBDCS1jG1kPTdDzReu42W3auQb3MUEcagSSI1mkw=",
-            "Address" to "10.0.0.2/32",
-            "DNS" to "1.1.1.1",
-            "Peer Public Key" to "4WB1RuKGq5MRgC47vojZJStwfpOPhzYpBMfwveMtyUI=",
-            "Endpoint" to "142.93.170.233:51820",
-            "Allowed IPs" to "0.0.0.0/0"
-        )
-
-        val currentConfig = mapOf(
-            "Private Key" to _uiState.value.privateKey,
-            "Public Key" to _uiState.value.publicKey,
-            "Address" to _uiState.value.address,
-            "DNS" to _uiState.value.dns,
-            "Peer Public Key" to _uiState.value.peerPublicKey,
-            "Endpoint" to _uiState.value.endpoint,
-            "Allowed IPs" to _uiState.value.allowedIps
-        )
-
-        Log.d("WireGuard", "=== Configuration Verification ===")
-        var allMatch = true
-
-        expectedConfig.forEach { (key, expected) ->
-            val current = currentConfig[key]
-            val matches = current == expected
-            if (!matches) allMatch = false
-
-            Log.d("WireGuard", "$key:")
-            Log.d("WireGuard", "  Expected: $expected")
-            Log.d("WireGuard", "  Current:  $current")
-            Log.d("WireGuard", "  Match:    ${if (matches) "✓" else "✗"}")
-        }
-
-        Log.d("WireGuard", "=================================")
-        Log.d("WireGuard", "All configurations match: ${if (allMatch) "YES ✓" else "NO ✗"}")
-
-        if (allMatch) {
-            Log.d("WireGuard", "Configuration is correct. If connection still fails:")
-            Log.d("WireGuard", "1. Check if server is running")
-            Log.d("WireGuard", "2. Verify your public key is on the server")
-            Log.d("WireGuard", "3. Try a different network")
-            Log.d("WireGuard", "4. Check server firewall rules")
-        }
     }
 
     fun checkAndConnect() {
@@ -200,6 +330,22 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun validateConfiguration(): String? {
         val state = _uiState.value
+
+        if (state.privateKey.isEmpty()) {
+            return "Please configure your private key in settings"
+        }
+
+        if (state.peerPublicKey.isEmpty()) {
+            return "Please configure the peer public key in settings"
+        }
+
+        if (state.endpoint.isEmpty()) {
+            return "Please configure the endpoint in settings"
+        }
+
+        if (state.address.isEmpty()) {
+            return "Please configure the interface address in settings"
+        }
 
         // Validate private key
         try {
@@ -264,7 +410,7 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
         Log.d("WireGuard", "connect() called - establishing WireGuard tunnel")
         viewModelScope.launch {
             try {
-                _uiState.value = _uiState.value.copy(errorMessage = "Connecting...")
+                _uiState.value = _uiState.value.copy(errorMessage = "")
 
                 val config = createConfig()
 
@@ -282,6 +428,11 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
                     backend.setState(tunnel, Tunnel.State.UP, config)
                 }
 
+                // Reset statistics
+                lastBytesReceived = 0L
+                lastBytesSent = 0L
+                lastStatTime = System.currentTimeMillis()
+
                 _uiState.value = _uiState.value.copy(
                     isConnected = true,
                     errorMessage = ""
@@ -294,11 +445,6 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
                 Log.i("WireGuard", "IMPORTANT: Make sure your public key is added to the server:")
                 Log.i("WireGuard", "Public Key: ${_uiState.value.publicKey}")
                 Log.i("WireGuard", "----------------------------------------")
-                Log.i("WireGuard", "If the handshake fails, check:")
-                Log.i("WireGuard", "1. Your public key is in the server's config")
-                Log.i("WireGuard", "2. The server's public key matches what you entered")
-                Log.i("WireGuard", "3. UDP port ${_uiState.value.endpoint.split(":").getOrNull(1) ?: "51820"} is not blocked")
-                Log.i("WireGuard", "4. The server is running and configured correctly")
 
             } catch (e: Exception) {
                 Log.e("WireGuard", "Connection failed", e)
@@ -328,7 +474,9 @@ class WireGuardViewModel(application: Application) : AndroidViewModel(applicatio
 
                 _uiState.value = _uiState.value.copy(
                     isConnected = false,
-                    errorMessage = ""
+                    errorMessage = "",
+                    downloadSpeed = 0L,
+                    uploadSpeed = 0L
                 )
                 showToast("WireGuard tunnel disconnected")
                 Log.i("WireGuard", "✓ Tunnel disconnected")
